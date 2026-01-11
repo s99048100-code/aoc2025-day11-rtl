@@ -1,79 +1,148 @@
+# AoC 2025 Day 11 — Synthesizable Verilog RTL + Testbench (Staged / Pipeline-Style)
+
+This repository provides a **synthesizable Verilog RTL** solution and a **ModelSim testbench** for Advent of Code 2025 Day 11, prepared in a hardware-oriented manner for Jane Street’s Advent of FPGA submission. The implementation follows a **staged / pipeline-style** methodology: streaming text is parsed into a graph representation, transformed into hardware-friendly adjacency storage, then solved using topological ordering and dynamic programming (DP). A control FSM sequences the stages and drives bounded memories and counters, producing **Part 1** and **Part 2** results with explicit `busy/out_valid/overflow` status.
+
+---
+
+## Repository Layout
+
+- `src/day11_top.v` — synthesizable top-level RTL
+- `tb/tb_day11.v` — testbench (reads `input.txt`, prints results, writes `results.txt`)
+- `sim/run.do` — ModelSim compile + run script
+
+---
+
+## Top-Level Interface (Streaming)
+
+### Input Stream
+- `in_valid` — input byte is valid
+- `in_byte[7:0]` — ASCII input byte
+- `in_last` — asserted on the final byte (end-of-stream)
+
+### Output / Status
+- `busy` — high while the design is processing
+- `out_valid` — asserted when outputs are ready (often a single-cycle pulse at DONE)
+- `part1[63:0]` — Part 1 answer
+- `part2[63:0]` — Part 2 answer
+- `overflow` — asserted when resource bounds are exceeded or consistency checks fail
+
+---
+
 ## Methodology (Academic / Hardware-Oriented)
 
-This solution treats the puzzle input as a labeled directed graph and implements the complete flow as a bounded, synthesizable RTL datapath controlled by an FSM. The key goal is to map a software-like graph algorithm into a hardware-friendly staged pipeline with explicit memory structures and termination conditions.
+### Problem Abstraction
+The input describes a directed graph whose vertices are **3-letter node names** and whose edges define valid transitions. The puzzle reduces to counting constrained path families:
 
-### Problem abstraction
+- **Part 1:** number of directed paths from `you` to `out`.
+- **Part 2:** number of directed paths from `svr` to `out` subject to a visitation constraint: the path must visit both `fft` and `dac` at least once.
 
-The input describes a directed graph whose vertices are 3-letter node names and whose edges define valid transitions. The task reduces to counting constrained path families on this graph:
+The hardware challenge is mapping (1) **streaming ASCII parsing** and (2) **irregular graph traversal** into deterministic, bounded-memory operations suitable for synthesizable RTL.
 
-- **Part 1** computes the number of directed paths from `you` to `out`.
-- **Part 2** computes the number of directed paths from `svr` to `out` subject to a visitation constraint: the path must visit both `fft` and `dac` at least once.
+---
 
-This formulation is naturally solved on a DAG using topological order. In hardware, the main challenge is converting (1) streaming text parsing and (2) irregular graph traversal into deterministic memory accesses with bounded resources.
+## Staged / Pipeline-Style Hardware Mapping
 
-### Hardware pipeline decomposition
+Instead of implementing the algorithm as a single monolithic “software loop,” the design is decomposed into stages. Each stage performs a fixed transformation using bounded RAM arrays and counters, and the control FSM sequences these stages.
 
-Instead of implementing the algorithm as one monolithic “do-everything” loop, the design is decomposed into stages that can be scheduled and verified independently. Each stage has clear input/output contracts and uses only bounded RAM arrays, making it synthesizable.
+### Stage 0 — Streaming Ingestion
+Consume ASCII bytes via `(in_valid, in_byte, in_last)`. A small parser FSM detects 3-letter tokens and separators without requiring the full input to be buffered as a string.
 
-**Stage 0 — Streaming ingestion**
-- The design consumes ASCII bytes via `(in_valid, in_byte, in_last)`.
-- A small parser FSM detects 3-letter tokens and separators.
+### Stage 1 — Tokenization & Node-ID Mapping
+Each 3-letter node name is converted into a compact **integer node ID** using a node table (name ↔ ID). This converts text-domain identifiers into fixed-width indices for RAM addressing.
 
-**Stage 1 — Tokenization and node-ID mapping**
-- Each 3-letter node name is encoded and mapped to a compact integer ID.
-- A node table is maintained so repeated names map to the same ID.
-- This converts text-domain identifiers into fixed-width IDs suitable for RAM indexing.
+### Stage 2 — Edge Capture (Edge RAM)
+As edges are parsed, store `(src_id, dst_id)` pairs into an edge RAM. In parallel, accumulate per-node **out-degree** counts needed for adjacency construction.
 
-**Stage 2 — Edge capture**
-- Parsed edges are stored as `(src_id, dst_id)` pairs in an edge RAM.
-- In parallel, per-node out-degree counters are accumulated to prepare adjacency construction.
+### Stage 3 — CSR (Compressed Sparse Row) Construction
+To enable efficient neighbor iteration in hardware, transform the edge list into CSR:
 
-**Stage 3 — CSR (Compressed Sparse Row) adjacency construction**
-To enable efficient neighbor iteration in later stages, the edge list is transformed into a CSR representation:
-- Compute prefix sums of out-degree to form `offset[u]` (start index of adjacency list of node `u`).
-- Populate `adj[offset[u] + k] = v` for each outgoing edge `u -> v`.
-- Compute `indegree[v]` for topological sorting.
-CSR converts irregular “list-of-lists” structure into two dense arrays (`offset[]`, `adj[]`) that are hardware-friendly.
+- `offset[u]`: start index of node `u`’s adjacency list in `adj[]` (computed by prefix-summing out-degrees)
+- `adj[]`: packed adjacency array; neighbors of `u` occupy `adj[offset[u] .. offset[u+1)-1]`
+- `indegree[v]`: computed for Kahn’s topological sort
 
-**Stage 4 — Topological sorting (Kahn)**
-- Initialize a FIFO with all nodes of indegree 0.
-- Pop nodes into `topo[]`, decrement neighbors’ indegree, and push newly-zero nodes.
-- A consistency check enforces `topo_len == node_count`. If violated (cycle / corruption / bounds exceeded), `overflow` asserts.
+CSR converts an irregular list-of-lists into two dense arrays (`offset[]`, `adj[]`) that are hardware-friendly for sequential scanning.
 
-**Stage 5 — Dynamic programming on the DAG**
-DP is performed in reverse-topological order, which ensures that when processing node `u`, all successors’ DP values are already available.
+### Stage 4 — Topological Sort (Kahn)
+Perform Kahn’s algorithm using a FIFO queue:
 
-- **Part 1 (unconstrained paths):**
-  - Maintain a scalar `dp1[u]` per node.
-  - Base case at sink: `dp1[out] = 1`.
-  - Transition: `dp1[u] = sum_{(u->v)} dp1[v]`.
+- initialize queue with all `indegree==0` nodes
+- pop into `topo[]`, decrement neighbors’ indegree, push newly-zero nodes
+- consistency check: if `topo_len != node_count`, assert `overflow`
 
-- **Part 2 (visitation constraint via mask DP):**
-  - Maintain `dp2[u][m]` where `m` is a 2-bit mask indicating whether `fft` and/or `dac` has been visited so far.
-  - The visitation mask is updated when traversing an edge to a special node.
-  - Base case: `dp2[out][m] = 1` only for masks satisfying the required condition; otherwise 0.
-  - Transition: `dp2[u][m] = sum_{(u->v)} dp2[v][m']`, where `m'` is the updated mask after moving to `v`.
+### Stage 5 — Dynamic Programming on the DAG
+Compute DP in **reverse topological order** so each node can accumulate contributions from successors whose DP values are already available.
 
-Finally, the outputs are latched and `out_valid` is asserted once when results are stable.
+#### Part 1: Unconstrained Path Count
+- state: `dp1[u]`
+- base: `dp1[out] = 1`
+- transition: `dp1[u] = Σ dp1[v]` over all edges `u -> v`
 
-### Control strategy and synthesizability
+#### Part 2: Visitation Constraint via Mask DP
+Use a 2-bit mask to track whether `fft` and/or `dac` have been visited:
 
-A single control FSM sequences the stages:
-`IDLE → PARSE → BUILD_CSR → TOPO_SORT → DP → DONE`.
+- state: `dp2[u][m]`, where `m ∈ {0..3}`
+  - bit0: visited `fft`
+  - bit1: visited `dac`
+- mask update occurs when stepping into a special node
+- base at `out`: only masks satisfying the requirement contribute; others are 0
+- transition: `dp2[u][m] = Σ dp2[v][m’]` where `m’` is the updated mask after moving to `v`
 
-Each stage uses bounded counters and explicit RAMs; no dynamic allocation or unbounded loops are used. Resource limits (MAXV/MAXE/MAXB) are enforced. If exceeded, `overflow` is asserted, and the design transitions to a safe terminal behavior.
+Finally:
+- `part1 = dp1[you]`
+- `part2 = dp2[svr][3]` (mask `11`, meaning both `fft` and `dac` visited)
 
-### Code-level mapping (where to look)
+### Stage 6 — Emit
+Latch outputs and assert `out_valid` when `part1/part2` are stable. `busy` deasserts in the terminal state.
 
-- `src/day11_top.v` contains:
-  - the parser/token extraction logic (streaming ASCII to tokens),
-  - node-ID mapping table updates,
-  - edge RAM writes and degree accumulation,
-  - CSR build logic (offset prefix sums and adjacency fill),
-  - Kahn topological sort and `topo[]` storage,
-  - reverse-topological DP engines for Part 1 and Part 2,
-  - output register/handshake generation (`busy`, `out_valid`, `overflow`).
+---
 
-- `tb/tb_day11.v` drives the input stream from `input.txt` and checks that the DUT produces stable `part1` and `part2` once `out_valid` is asserted. The testbench prints the answers and writes `results.txt` for reproducibility.
+## Control Strategy (FSM Scheduling)
 
-This staged design is intentionally “hardware-first”: the algorithm is expressed as deterministic memory transformations and DP scans, matching the constraints of synthesizable RTL.
+A single FSM sequences the full flow (conceptually):
+
+`IDLE → PARSE → BUILD_CSR → TOPO_SORT → DP → DONE`
+
+- `busy=1` from PARSE through DP
+- `out_valid` asserted when DONE is reached (often a pulse)
+- `overflow` asserted when bounds are exceeded or consistency checks fail
+
+This scheduling style is intentionally hardware-first: the algorithm is expressed as deterministic memory transformations and bounded scans rather than software loops.
+
+---
+
+## Resource Bounds (Synthesizable Limits)
+
+The design uses fixed-size RAM arrays and explicit limits. If any limit is exceeded, `overflow` asserts.
+
+- MAXV: maximum number of nodes
+- MAXE: maximum number of edges
+- MAXB: maximum number of input bytes
+
+(Refer to `src/day11_top.v` for the actual parameter/localparam values.)
+
+---
+
+## Verification / Testbench Strategy
+
+`tb/tb_day11.v`:
+1. reads `input.txt` from the repository root
+2. streams the file byte-by-byte into the DUT
+3. waits for `out_valid`
+4. prints `Part 1 / Part 2 / overflow` in the Transcript
+5. writes `results.txt` to the repository root
+
+---
+
+## How to Run Simulation (ModelSim)
+
+### Step 1 — Prepare input
+Place your puzzle input in the repository root as:
+- `input.txt` (same level as `src/`, `tb/`, `sim/`)
+
+Do not commit personal inputs to a public repository; exclude `input.txt` via `.gitignore`.
+
+### Step 2 — Run (GUI)
+1. Open ModelSim.
+2. In the Transcript, change directory to the repository root (example path):
+```tcl
+cd D:/modelsimmm/janestreet12
