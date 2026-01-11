@@ -1,6 +1,6 @@
 # AoC 2025 Day 11 — Synthesizable Verilog RTL + Testbench (Staged / Pipeline-Style)
 
-This repository provides a **synthesizable Verilog RTL** solution and a **ModelSim testbench** for Advent of Code 2025 Day 11, prepared in a hardware-oriented manner for Jane Street’s Advent of FPGA submission. The implementation follows a **staged / pipeline-style** methodology: streaming text is parsed into a graph representation, transformed into hardware-friendly adjacency storage, then solved using topological ordering and dynamic programming (DP). A control FSM sequences the stages and drives bounded memories and counters, producing **Part 1** and **Part 2** results with explicit `busy/out_valid/overflow` status.
+This repository provides a **synthesizable Verilog RTL** solution and a **ModelSim testbench** for Advent of Code 2025 Day 11, prepared in a hardware-oriented manner for a reproducible FPGA-style submission. The implementation follows a **staged / pipeline-style** methodology: streaming ASCII input is parsed into a directed graph, transformed into hardware-friendly adjacency storage, then solved using topological ordering and dynamic programming (DP). A control FSM sequences bounded RAMs and counters, producing **Part 1** and **Part 2** outputs with explicit `busy/out_valid/overflow` status.
 
 ---
 
@@ -133,16 +133,51 @@ The design uses fixed-size RAM arrays and explicit limits. If any limit is excee
 
 ---
 
-## How to Run Simulation (ModelSim)
+## Complexity, Throughput Notes, and Completion Semantics
 
-### Step 1 — Prepare input
-Place your puzzle input in the repository root as:
-- `input.txt` (same level as `src/`, `tb/`, `sim/`)
+### Stage complexity (hardware view)
 
-Do not commit personal inputs to a public repository; exclude `input.txt` via `.gitignore`.
+Let:
+- **B** = number of input bytes streamed (`in_valid` cycles),
+- **V** = number of unique nodes,
+- **E** = number of directed edges.
 
-### Step 2 — Run (GUI)
-1. Open ModelSim.
-2. In the Transcript, change directory to the repository root (example path):
+The staged datapath is designed as bounded scans over on-chip memories:
+
+- **Parse + node mapping:**  Θ(B)  
+  Streaming ASCII parsing; node table lookup/insert is bounded and performed incrementally.
+- **CSR build (degree → prefix-sum → adjacency fill):**  Θ(V + E)  
+  One pass to compute degrees, one prefix-sum over V, and one pass over E to fill `adj[]`.
+- **Topological sort (Kahn):**  Θ(V + E)  
+  Each node is enqueued/dequeued once; each edge decrements indegree once.
+- **DP (reverse-topological):**
+  - **Part 1:** Θ(V + E)
+  - **Part 2:** Θ(4·(V + E)) due to the 2-bit visitation mask (4 states per node)
+
+This is intentionally “hardware-first”: every phase is a predictable scan with explicit counters and fixed RAM arrays, rather than an unbounded software loop.
+
+### Handshake / completion semantics
+
+- The DUT consumes the input stream using:
+  - `in_valid` (byte valid), `in_byte[7:0]` (ASCII), and `in_last` (end-of-stream).
+- While processing, `busy=1`.
+- When the results are ready, `out_valid` is asserted (often as a pulse at completion). At this point:
+  - `part1` and `part2` are stable and can be sampled,
+  - `busy` transitions low shortly after (or at the same time, depending on the internal sequencing).
+- `overflow=1` indicates the design hit a bounded-resource limit or a consistency check failure
+  (e.g., exceeded MAXV/MAXE/MAXB, or `topo_len != V` implying a cycle/inconsistency under the design’s checks).
+
+### Reproducibility and common pitfalls
+
+The reference flow is:
+1. Place your puzzle input in repo root as `input.txt`.
+2. Run `do sim/run.do` in ModelSim.
+3. Read results in:
+   - ModelSim Transcript (printed Part 1 / Part 2 / overflow),
+   - and `results.txt` generated in the repo root.
+
+If results do not appear, the most common issue is running the script from the wrong directory.
+In the Transcript, verify you are in the repository root:
 ```tcl
-cd D:/modelsimmm/janestreet12
+pwd
+dir
