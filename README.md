@@ -24,22 +24,6 @@ Output:
 
 ## Design overview (hardware-oriented)
 
-flowchart TD
-  A[Start / Reset] --> B[Stream input bytes]
-  B --> C[Parse tokens: SRC, DST]
-  C --> D[Node mapping: 3-letter name -> node_id]
-  D --> E[Store edge list (src_id, dst_id)]
-  E --> F[Build CSR adjacency<br/>outdeg -> prefix-sum offsets -> adj array]
-  F --> G[Kahn topo sort<br/>queue indeg==0 -> topo[]]
-  G --> H{topo_len == node_count?}
-  H -- no --> X[Set overflow=1<br/>Output 0/0]
-  H -- yes --> I[Reverse-topo DP]
-  I --> J[Part1: dp1 paths you->out]
-  I --> K[Part2: dp2 with mask visits fft&dac]
-  J --> L[Emit part1/part2 + out_valid]
-  K --> L
-
-
 The solver is implemented as a small control FSM with bounded on-chip memories. It consumes the puzzle input as an ASCII byte stream and produces Part 1 / Part 2 answers when computation completes.
 
 ### Pipeline / stages
