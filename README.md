@@ -1,42 +1,160 @@
 # AoC 2025 Day 11 — Synthesizable Verilog RTL + Testbench (Staged / Pipeline-Style)
 
-This repository provides a **synthesizable Verilog RTL** solution and a **ModelSim testbench** for Advent of Code 2025 Day 11, prepared in a hardware-oriented manner for a reproducible FPGA-style submission. The implementation follows a **staged / pipeline-style** methodology: streaming ASCII input is parsed into a directed graph, transformed into hardware-friendly adjacency storage, then solved using topological ordering and dynamic programming (DP). A control FSM sequences bounded RAMs and counters, producing **Part 1** and **Part 2** outputs with explicit `busy/out_valid/overflow` status.
+This repository provides a synthesizable Verilog RTL solution and a ModelSim testbench for Advent of Code 2025 Day 11, prepared in a hardware-oriented manner for a reproducible FPGA-style submission. The implementation follows a staged / pipeline-style methodology: streaming ASCII input is parsed into a directed graph, transformed into hardware-friendly adjacency storage, then solved using topological ordering and dynamic programming (DP). A control FSM sequences bounded RAMs and counters, producing Part 1 and Part 2 outputs with explicit busy/out_valid/overflow status.
+
+---
+
+## Visual Aids (Mermaid)
+
+### 1) End-to-end staged datapath (streaming → graph → CSR → topo → DP → outputs)
+
+```mermaid
+flowchart LR
+  IN[Input Stream<br/>in_valid / in_byte[7:0] / in_last] --> S0
+
+  subgraph S0[Stage 0 — Streaming Ingestion]
+    P0[Parser FSM<br/>detect 3-letter tokens + separators]
+  end
+
+  S0 --> S1
+
+  subgraph S1[Stage 1 — Tokenization & Node-ID Mapping]
+    NT[(Node Table<br/>name ↔ ID)] --> ID[node_id]
+  end
+
+  S1 --> S2
+
+  subgraph S2[Stage 2 — Edge Capture (Edge RAM)]
+    ER[(edge RAM<br/>(src_id,dst_id))]:::ram
+    OD[(out-degree[u])]:::ram
+  end
+
+  ID --> ER
+  ID --> OD
+
+  S2 --> S3
+
+  subgraph S3[Stage 3 — CSR (Compressed Sparse Row) Construction]
+    OFF[(offset[u])]:::ram
+    ADJ[(adj[])]:::ram
+    IND[(indegree[v])]:::ram
+    PS[Prefix-sum out-degree] --> OFF
+    FILL[Fill packed adjacency] --> ADJ
+    DEG[Compute indegree] --> IND
+  end
+
+  ER --> FILL
+  OD --> PS
+  ER --> DEG
+
+  S3 --> S4
+
+  subgraph S4[Stage 4 — Topological Sort (Kahn)]
+    Q[(FIFO queue)]:::ram
+    TOPO[(topo[])]:::ram
+    INIT[Init: enqueue all indegree==0 nodes] --> Q
+    POP[Pop node] --> TOPO
+    POP --> DEC[For each neighbor: indegree--]
+    DEC --> PUSH[Push newly-zero nodes]
+    PUSH --> Q
+    CHK{topo_len == node_count ?} -->|no| OF[overflow=1]
+    CHK -->|yes| OK[Topo OK]
+  end
+
+  OFF --> DEC
+  ADJ --> DEC
+  IND --> INIT
+
+  S4 --> S5
+
+  subgraph S5[Stage 5 — Dynamic Programming on the DAG]
+    direction LR
+    DP1[(dp1[u])]:::ram
+    DP2[(dp2[u][mask])]:::ram
+    BASE[Base: dp1[out]=1<br/>dp2[out][*] per constraint] --> REV[Reverse topo scan]
+    REV --> ACC1[Part 1: dp1[u] = Σ dp1[v] over u→v]
+    REV --> ACC2[Part 2: dp2[u][m] = Σ dp2[v][m'] with mask update]
+    ACC1 --> OUT1[part1 = dp1[you]]
+    ACC2 --> OUT2[part2 = dp2[svr][3] (mask 11)]
+  end
+
+  TOPO --> REV
+  OFF --> REV
+  ADJ --> REV
+
+  S5 --> S6
+
+  subgraph S6[Stage 6 — Emit]
+    LATCH[Latch part1/part2<br/>assert out_valid] --> OUT[Outputs<br/>busy / out_valid / part1[63:0] / part2[63:0] / overflow]
+  end
+
+  OUT1 --> LATCH
+  OUT2 --> LATCH
+  OF --> OUT
+
+  classDef ram fill:#f7f7f7,stroke:#555,stroke-width:1px;
+```
+
+### 2) Control FSM schedule (conceptual)
+
+```mermaid
+stateDiagram-v2
+  [*] --> IDLE
+
+  IDLE --> PARSE: stream starts (in_valid)
+  PARSE --> BUILD_CSR: end-of-stream (in_last)
+
+  BUILD_CSR --> TOPO_SORT: CSR ready
+  TOPO_SORT --> DP: topo ready && !overflow
+  TOPO_SORT --> DONE: overflow
+
+  DP --> DONE: dp_done
+  DONE --> IDLE: reset / new run
+
+  note right of PARSE
+    busy=1 from PARSE through DP
+  end note
+
+  note right of DONE
+    out_valid asserted at completion (often a pulse)
+  end note
+```
 
 ---
 
 ## Repository Layout
 
-- `src/day11_top.v` — synthesizable top-level RTL
-- `tb/tb_day11.v` — testbench (reads `input.txt`, prints results, writes `results.txt`)
-- `sim/run.do` — ModelSim compile + run script
+- `src/day11_top.v` — synthesizable top-level RTL  
+- `tb/tb_day11.v` — testbench (reads `input.txt`, prints results, writes `results.txt`)  
+- `sim/run.do` — ModelSim compile + run script  
 
 ---
 
 ## Top-Level Interface (Streaming)
 
 ### Input Stream
-- `in_valid` — input byte is valid
-- `in_byte[7:0]` — ASCII input byte
-- `in_last` — asserted on the final byte (end-of-stream)
+- `in_valid` — input byte is valid  
+- `in_byte[7:0]` — ASCII input byte  
+- `in_last` — asserted on the final byte (end-of-stream)  
 
 ### Output / Status
-- `busy` — high while the design is processing
-- `out_valid` — asserted when outputs are ready (often a single-cycle pulse at DONE)
-- `part1[63:0]` — Part 1 answer
-- `part2[63:0]` — Part 2 answer
-- `overflow` — asserted when resource bounds are exceeded or consistency checks fail
+- `busy` — high while the design is processing  
+- `out_valid` — asserted when outputs are ready (often a single-cycle pulse at DONE)  
+- `part1[63:0]` — Part 1 answer  
+- `part2[63:0]` — Part 2 answer  
+- `overflow` — asserted when resource bounds are exceeded or consistency checks fail  
 
 ---
 
 ## Methodology (Academic / Hardware-Oriented)
 
 ### Problem Abstraction
-The input describes a directed graph whose vertices are **3-letter node names** and whose edges define valid transitions. The puzzle reduces to counting constrained path families:
+The input describes a directed graph whose vertices are 3-letter node names and whose edges define valid transitions. The puzzle reduces to counting constrained path families:
 
-- **Part 1:** number of directed paths from `you` to `out`.
-- **Part 2:** number of directed paths from `svr` to `out` subject to a visitation constraint: the path must visit both `fft` and `dac` at least once.
+- **Part 1**: number of directed paths from `you` to `out`.  
+- **Part 2**: number of directed paths from `svr` to `out` subject to a visitation constraint: the path must visit both `fft` and `dac` at least once.
 
-The hardware challenge is mapping (1) **streaming ASCII parsing** and (2) **irregular graph traversal** into deterministic, bounded-memory operations suitable for synthesizable RTL.
+The hardware challenge is mapping (1) streaming ASCII parsing and (2) irregular graph traversal into deterministic, bounded-memory operations suitable for synthesizable RTL.
 
 ---
 
@@ -48,48 +166,48 @@ Instead of implementing the algorithm as a single monolithic “software loop,�
 Consume ASCII bytes via `(in_valid, in_byte, in_last)`. A small parser FSM detects 3-letter tokens and separators without requiring the full input to be buffered as a string.
 
 ### Stage 1 — Tokenization & Node-ID Mapping
-Each 3-letter node name is converted into a compact **integer node ID** using a node table (name ↔ ID). This converts text-domain identifiers into fixed-width indices for RAM addressing.
+Each 3-letter node name is converted into a compact integer node ID using a node table (name ↔ ID). This converts text-domain identifiers into fixed-width indices for RAM addressing.
 
 ### Stage 2 — Edge Capture (Edge RAM)
-As edges are parsed, store `(src_id, dst_id)` pairs into an edge RAM. In parallel, accumulate per-node **out-degree** counts needed for adjacency construction.
+As edges are parsed, store `(src_id, dst_id)` pairs into an edge RAM. In parallel, accumulate per-node out-degree counts needed for adjacency construction.
 
 ### Stage 3 — CSR (Compressed Sparse Row) Construction
 To enable efficient neighbor iteration in hardware, transform the edge list into CSR:
 
-- `offset[u]`: start index of node `u`’s adjacency list in `adj[]` (computed by prefix-summing out-degrees)
-- `adj[]`: packed adjacency array; neighbors of `u` occupy `adj[offset[u] .. offset[u+1)-1]`
-- `indegree[v]`: computed for Kahn’s topological sort
+- `offset[u]`: start index of node `u`’s adjacency list in `adj[]` (computed by prefix-summing out-degrees)  
+- `adj[]`: packed adjacency array; neighbors of `u` occupy `adj[offset[u] .. offset[u+1)-1]`  
+- `indegree[v]`: computed for Kahn’s topological sort  
 
 CSR converts an irregular list-of-lists into two dense arrays (`offset[]`, `adj[]`) that are hardware-friendly for sequential scanning.
 
 ### Stage 4 — Topological Sort (Kahn)
 Perform Kahn’s algorithm using a FIFO queue:
 
-- initialize queue with all `indegree==0` nodes
-- pop into `topo[]`, decrement neighbors’ indegree, push newly-zero nodes
-- consistency check: if `topo_len != node_count`, assert `overflow`
+- initialize queue with all `indegree==0` nodes  
+- pop into `topo[]`, decrement neighbors’ `indegree`, push newly-zero nodes  
+- consistency check: if `topo_len != node_count`, assert `overflow`  
 
 ### Stage 5 — Dynamic Programming on the DAG
-Compute DP in **reverse topological order** so each node can accumulate contributions from successors whose DP values are already available.
+Compute DP in reverse topological order so each node can accumulate contributions from successors whose DP values are already available.
 
 #### Part 1: Unconstrained Path Count
-- state: `dp1[u]`
-- base: `dp1[out] = 1`
-- transition: `dp1[u] = Σ dp1[v]` over all edges `u -> v`
+- state: `dp1[u]`  
+- base: `dp1[out] = 1`  
+- transition: `dp1[u] = Σ dp1[v]` over all edges `u -> v`  
 
 #### Part 2: Visitation Constraint via Mask DP
 Use a 2-bit mask to track whether `fft` and/or `dac` have been visited:
 
-- state: `dp2[u][m]`, where `m ∈ {0..3}`
-  - bit0: visited `fft`
-  - bit1: visited `dac`
-- mask update occurs when stepping into a special node
-- base at `out`: only masks satisfying the requirement contribute; others are 0
-- transition: `dp2[u][m] = Σ dp2[v][m’]` where `m’` is the updated mask after moving to `v`
+- state: `dp2[u][m]`, where `m ∈ {0..3}`  
+- bit0: visited `fft`  
+- bit1: visited `dac`  
+- mask update occurs when stepping into a special node  
+- base at `out`: only masks satisfying the requirement contribute; others are 0  
+- transition: `dp2[u][m] = Σ dp2[v][m’]` where `m’` is the updated mask after moving to `v`  
 
 Finally:
-- `part1 = dp1[you]`
-- `part2 = dp2[svr][3]` (mask `11`, meaning both `fft` and `dac` visited)
+- `part1 = dp1[you]`  
+- `part2 = dp2[svr][3]` (mask `11`, meaning both `fft` and `dac` visited)  
 
 ### Stage 6 — Emit
 Latch outputs and assert `out_valid` when `part1/part2` are stable. `busy` deasserts in the terminal state.
@@ -102,9 +220,9 @@ A single FSM sequences the full flow (conceptually):
 
 `IDLE → PARSE → BUILD_CSR → TOPO_SORT → DP → DONE`
 
-- `busy=1` from PARSE through DP
-- `out_valid` asserted when DONE is reached (often a pulse)
-- `overflow` asserted when bounds are exceeded or consistency checks fail
+- `busy=1` from PARSE through DP  
+- `out_valid` asserted when DONE is reached (often a pulse)  
+- `overflow` asserted when bounds are exceeded or consistency checks fail  
 
 This scheduling style is intentionally hardware-first: the algorithm is expressed as deterministic memory transformations and bounded scans rather than software loops.
 
@@ -114,9 +232,9 @@ This scheduling style is intentionally hardware-first: the algorithm is expresse
 
 The design uses fixed-size RAM arrays and explicit limits. If any limit is exceeded, `overflow` asserts.
 
-- MAXV: maximum number of nodes
-- MAXE: maximum number of edges
-- MAXB: maximum number of input bytes
+- `MAXV`: maximum number of nodes  
+- `MAXE`: maximum number of edges  
+- `MAXB`: maximum number of input bytes  
 
 (Refer to `src/day11_top.v` for the actual parameter/localparam values.)
 
@@ -125,59 +243,65 @@ The design uses fixed-size RAM arrays and explicit limits. If any limit is excee
 ## Verification / Testbench Strategy
 
 `tb/tb_day11.v`:
-1. reads `input.txt` from the repository root
-2. streams the file byte-by-byte into the DUT
-3. waits for `out_valid`
-4. prints `Part 1 / Part 2 / overflow` in the Transcript
-5. writes `results.txt` to the repository root
+
+- reads `input.txt` from the repository root  
+- streams the file byte-by-byte into the DUT  
+- waits for `out_valid`  
+- prints Part 1 / Part 2 / overflow in the Transcript  
+- writes `results.txt` to the repository root  
 
 ---
 
 ## Complexity, Throughput Notes, and Completion Semantics
 
 ### Stage complexity (hardware view)
-
 Let:
-- **B** = number of input bytes streamed (`in_valid` cycles),
-- **V** = number of unique nodes,
-- **E** = number of directed edges.
+
+- `B` = number of input bytes streamed (`in_valid` cycles)  
+- `V` = number of unique nodes  
+- `E` = number of directed edges  
 
 The staged datapath is designed as bounded scans over on-chip memories:
 
-- **Parse + node mapping:**  Θ(B)  
+- Parse + node mapping: Θ(B)  
   Streaming ASCII parsing; node table lookup/insert is bounded and performed incrementally.
-- **CSR build (degree → prefix-sum → adjacency fill):**  Θ(V + E)  
+- CSR build (degree → prefix-sum → adjacency fill): Θ(V + E)  
   One pass to compute degrees, one prefix-sum over V, and one pass over E to fill `adj[]`.
-- **Topological sort (Kahn):**  Θ(V + E)  
-  Each node is enqueued/dequeued once; each edge decrements indegree once.
-- **DP (reverse-topological):**
-  - **Part 1:** Θ(V + E)
-  - **Part 2:** Θ(4·(V + E)) due to the 2-bit visitation mask (4 states per node)
+- Topological sort (Kahn): Θ(V + E)  
+  Each node is enqueued/dequeued once; each edge decrements `indegree` once.
+- DP (reverse-topological):
+  - Part 1: Θ(V + E)
+  - Part 2: Θ(4·(V + E)) due to the 2-bit visitation mask (4 states per node)
 
 This is intentionally “hardware-first”: every phase is a predictable scan with explicit counters and fixed RAM arrays, rather than an unbounded software loop.
 
 ### Handshake / completion semantics
+The DUT consumes the input stream using:
+`in_valid` (byte valid), `in_byte[7:0]` (ASCII), and `in_last` (end-of-stream).
 
-- The DUT consumes the input stream using:
-  - `in_valid` (byte valid), `in_byte[7:0]` (ASCII), and `in_last` (end-of-stream).
-- While processing, `busy=1`.
-- When the results are ready, `out_valid` is asserted (often as a pulse at completion). At this point:
-  - `part1` and `part2` are stable and can be sampled,
-  - `busy` transitions low shortly after (or at the same time, depending on the internal sequencing).
-- `overflow=1` indicates the design hit a bounded-resource limit or a consistency check failure
-  (e.g., exceeded MAXV/MAXE/MAXB, or `topo_len != V` implying a cycle/inconsistency under the design’s checks).
+While processing, `busy=1`.
 
-### Reproducibility and common pitfalls
+When the results are ready, `out_valid` is asserted (often as a pulse at completion). At this point:
+
+- `part1` and `part2` are stable and can be sampled  
+- `busy` transitions low shortly after (or at the same time, depending on the internal sequencing)
+
+`overflow=1` indicates the design hit a bounded-resource limit or a consistency check failure (e.g., exceeded MAXV/MAXE/MAXB, or `topo_len != V` implying a cycle/inconsistency under the design’s checks).
+
+---
+
+## Reproducibility and common pitfalls
 
 The reference flow is:
-1. Place your puzzle input in repo root as `input.txt`.
-2. Run `do sim/run.do` in ModelSim.
-3. Read results in:
-   - ModelSim Transcript (printed Part 1 / Part 2 / overflow),
-   - and `results.txt` generated in the repo root.
 
-If results do not appear, the most common issue is running the script from the wrong directory.
-In the Transcript, verify you are in the repository root:
-```tcl
-pwd
-dir
+1. Place your puzzle input in repo root as `input.txt`.  
+2. Run `do sim/run.do` in ModelSim.  
+3. Read results in:
+   - ModelSim Transcript (printed Part 1 / Part 2 / overflow), and  
+   - `results.txt` generated in the repo root.
+
+If results do not appear, the most common issue is running the script from the wrong directory. In the Transcript, verify you are in the repository root:
+
+- `pwd`  
+- `dir`  
+
