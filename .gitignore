@@ -1,0 +1,8 @@
+work/
+vsim.wlf
+*.wlf
+modelsim.ini
+transcript
+input.txt
+input.local.txt
+results.txt
