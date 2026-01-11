@@ -12,85 +12,28 @@ This repository provides a synthesizable Verilog RTL solution and a ModelSim tes
 flowchart LR
   IN["Input Stream<br/>in_valid / in_byte(7:0) / in_last"] --> S0
 
-  subgraph S0["Stage 0 — Streaming Ingestion"]
-    P0["Parser FSM<br/>detect 3-letter tokens + separators"]
-  end
+  S0["Stage 0<br/>Streaming Ingestion"] --> S1["Stage 1<br/>Tokenize + Node-ID Map"]
+  S1 --> S2["Stage 2<br/>Edge Capture"]
 
-  S0 --> S1
+  S2 --> CSR["Stage 3<br/>Build CSR Adjacency"]
+  CSR --> TOPO["Stage 4<br/>Topological Sort (Kahn)"]
+  TOPO --> DP["Stage 5<br/>Reverse-Topo DP"]
+  DP --> EMIT["Stage 6<br/>Emit / out_valid"]
 
-  subgraph S1["Stage 1 — Tokenization & Node-ID Mapping"]
-    NT["Node Table<br/>name ↔ ID"] --> ID["node_id"]
-  end
+  %% Key memories / artifacts (minimal)
+  S2 --> ER["edge RAM (src,dst)"]:::ram
+  S2 --> OD["out_degree(u)"]:::ram
 
-  S1 --> S2
+  CSR --> OFF["offset(u)"]:::ram
+  CSR --> ADJ["adj(i)"]:::ram
+  CSR --> IND["indegree(v)"]:::ram
 
-  subgraph S2["Stage 2 — Edge Capture (Edge RAM)"]
-    ER["edge RAM<br/>(src_id, dst_id)"]:::ram
-    OD["out_degree(u)"]:::ram
-  end
+  TOPO --> TV["topo(k)"]:::ram
 
-  ID --> ER
-  ID --> OD
+  DP --> D1["dp1(u)"]:::ram
+  DP --> D2["dp2(u,mask)"]:::ram
 
-  S2 --> S3
-
-  subgraph S3["Stage 3 — CSR (Compressed Sparse Row) Construction"]
-    OFF["offset(u)"]:::ram
-    ADJ["adj(i)"]:::ram
-    IND["indegree(v)"]:::ram
-    PS["Prefix-sum out_degree"] --> OFF
-    FILL["Fill packed adjacency"] --> ADJ
-    DEG["Compute indegree"] --> IND
-  end
-
-  ER --> FILL
-  OD --> PS
-  ER --> DEG
-
-  S3 --> S4
-
-  subgraph S4["Stage 4 — Topological Sort (Kahn)"]
-    Q["FIFO queue"]:::ram
-    TOPO["topo(k)"]:::ram
-    INIT["Init: enqueue all indegree==0 nodes"] --> Q
-    POP["Pop node"] --> TOPO
-    POP --> DEC["For each neighbor: indegree--"]
-    DEC --> PUSH["Push newly-zero nodes"]
-    PUSH --> Q
-    CHK{"topo_len == node_count ?"} -->|no| OF["overflow = 1"]
-    CHK -->|yes| OK["Topo OK"]
-  end
-
-  OFF --> DEC
-  ADJ --> DEC
-  IND --> INIT
-
-  S4 --> S5
-
-  subgraph S5["Stage 5 — Dynamic Programming on the DAG"]
-    direction LR
-    DP1["dp1(u)"]:::ram
-    DP2["dp2(u,mask)"]:::ram
-    BASE["Base: dp1(out)=1<br/>dp2(out,*) per constraint"] --> REV["Reverse topo scan"]
-    REV --> ACC1["Part 1: dp1(u) = Σ dp1(v) over u→v"]
-    REV --> ACC2["Part 2: dp2(u,m) = Σ dp2(v,m') with mask update"]
-    ACC1 --> OUT1["part1 = dp1(you)"]
-    ACC2 --> OUT2["part2 = dp2(svr, 3)  (mask 11)"]
-  end
-
-  TOPO --> REV
-  OFF --> REV
-  ADJ --> REV
-
-  S5 --> S6
-
-  subgraph S6["Stage 6 — Emit"]
-    LATCH["Latch part1/part2<br/>assert out_valid"] --> OUT["Outputs<br/>busy / out_valid / part1(63:0) / part2(63:0) / overflow"]
-  end
-
-  OUT1 --> LATCH
-  OUT2 --> LATCH
-  OF --> OUT
+  EMIT --> OUT["Outputs<br/>busy / out_valid / part1(63:0) / part2(63:0) / overflow"]
 
   classDef ram fill:#f7f7f7,stroke:#555,stroke-width:1px;
 ```
