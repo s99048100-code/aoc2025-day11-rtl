@@ -4,6 +4,59 @@ This repository provides a **synthesizable Verilog RTL** solution and a **ModelS
 
 ---
 
+```mermaid
+graph TD
+    %% 定義樣式
+    classDef memory fill:#f9f,stroke:#333,stroke-width:2px;
+    classDef logic fill:#e1f5fe,stroke:#0277bd,stroke-width:2px;
+    classDef state fill:#fff9c4,stroke:#fbc02d,stroke-width:2px;
+
+    %% 輸入階段
+    Input[("ASCII Stream Input")]:::state --> Parser
+
+    %% 階段 1: 解析與映射
+    subgraph Stage1_Parse ["Stage 1: Parse & Map"]
+        direction TB
+        Parser("Stream Parser<br/>(3-Char Window)"):::logic --> Mapper{"Node Exists?"}:::logic
+        Mapper -- No --> NewID["Assign Compact ID"]:::logic
+        Mapper -- Yes --> GetID["Get ID"]:::logic
+        NewID --> EdgeStore[("Edge Storage<br/>(src, dst)")]:::memory
+        GetID --> EdgeStore
+    end
+
+    %% 階段 2: 建構 CSR
+    subgraph Stage2_CSR ["Stage 2: CSR Construction"]
+        EdgeStore --> Degree["Compute Out-Degree"]:::logic
+        Degree --> Prefix["Prefix Sum (Offsets)"]:::logic
+        Prefix --> AdjRAM[("Adjacency RAM<br/>(CSR Packed)")]:::memory
+        AdjRAM --> Indegree["Compute Indegree"]:::logic
+    end
+
+    %% 階段 3: 拓撲排序
+    subgraph Stage3_Topo ["Stage 3: Topo Sort (Kahn's Algo)"]
+        Indegree --> QueueInit["Queue Indegree=0 Nodes"]:::logic
+        QueueInit --> PopNode("Pop Node"):::logic
+        PopNode --> TopoRAM[("Topo Order RAM")]:::memory
+        PopNode --> Decr["Decrement Neighbor Indegree"]:::logic
+        Decr --> ZeroCheck{"Indegree == 0?"}:::logic
+        ZeroCheck -- Yes --> PushQ["Push to Queue"]:::logic
+        ZeroCheck -- No --> LoopCheck
+        PushQ --> LoopCheck{"Queue Empty?"}
+        LoopCheck -- No --> PopNode
+    end
+
+    %% 階段 4: DAG DP
+    subgraph Stage4_DP ["Stage 4: DAG DP Solver"]
+        LoopCheck -- Yes --> ReadTopo("Read Topo RAM<br/>(Reverse Order)"):::logic
+        ReadTopo --> DP_Logic["Update DP States<br/>Part 1: Path Count<br/>Part 2: Mask Tracking"]:::logic
+        DP_Logic --> DP_RAM[("DP Table Registers")]:::memory
+        DP_RAM --> NextNode{"All Nodes Done?"}
+        NextNode -- No --> ReadTopo
+    end
+
+    %% 輸出
+    NextNode -- Yes --> Valid((("out_valid<br/>Result Ready"))):::state
+
 ## Repository Layout
 
 - `src/day11_top.v` — synthesizable top-level RTL
